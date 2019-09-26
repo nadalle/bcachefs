@@ -204,7 +204,7 @@ int __must_check bch2_write_inode_size(struct bch_fs *c,
 		.fields		= fields,
 	};
 
-	return bch2_write_inode(c, inode, inode_set_size, &s, fields);
+	return bch2_write_inode(c, inode, inode_set_size, &s);
 }
 
 static void i_sectors_acct(struct bch_fs *c, struct bch_inode_info *inode,
@@ -2433,6 +2433,21 @@ static int bch2_truncate_page(struct bch_inode_info *inode, loff_t from)
 				    from, round_up(from, PAGE_SIZE));
 }
 
+static int bch2_extend_fn(struct bch_inode_info *inode,
+			  struct bch_inode_unpacked *bi,
+			  void *p)
+{
+	struct bch_fs *c = inode->v.i_sb->s_fs_info;
+	struct iattr *attr = p;
+
+	if (!(attr->ia_valid & (ATTR_CTIME|ATTR_MTIME)))
+		bi->bi_mtime = bi->bi_ctime = bch2_current_time(c);
+
+	bch2_setattr_copy(inode, bi, attr);
+	bi->bi_size = attr->ia_size;
+	return 0;
+}
+
 static int bch2_extend(struct bch_inode_info *inode, struct iattr *iattr)
 {
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
@@ -2445,30 +2460,31 @@ static int bch2_extend(struct bch_inode_info *inode, struct iattr *iattr)
 		return ret;
 
 	truncate_setsize(&inode->v, iattr->ia_size);
-	setattr_copy(&inode->v, iattr);
 
-	return bch2_write_inode_size(c, inode, inode->v.i_size,
-				     ATTR_MTIME|ATTR_CTIME);
+	return bch2_write_inode(c, inode, bch2_extend_fn, iattr);
 }
 
 static int bch2_truncate_finish_fn(struct bch_inode_info *inode,
 				   struct bch_inode_unpacked *bi,
 				   void *p)
 {
-	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-
 	bi->bi_flags &= ~BCH_INODE_I_SIZE_DIRTY;
-	bi->bi_mtime = bi->bi_ctime = bch2_current_time(c);
 	return 0;
 }
 
 static int bch2_truncate_start_fn(struct bch_inode_info *inode,
 				  struct bch_inode_unpacked *bi, void *p)
 {
-	u64 *new_i_size = p;
+	struct bch_fs *c = inode->v.i_sb->s_fs_info;
+	struct iattr *attr = p;
 
+	if (attr->ia_size != inode->v.i_size &&
+	    !(attr->ia_valid & (ATTR_CTIME|ATTR_MTIME)))
+		bi->bi_mtime = bi->bi_ctime = bch2_current_time(c);
+
+	bch2_setattr_copy(inode, bi, attr);
 	bi->bi_flags |= BCH_INODE_I_SIZE_DIRTY;
-	bi->bi_size = *new_i_size;
+	bi->bi_size = attr->ia_size;
 	return 0;
 }
 
@@ -2476,7 +2492,6 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 {
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
 	struct address_space *mapping = inode->v.i_mapping;
-	u64 new_i_size = iattr->ia_size;
 	bool shrink;
 	int ret = 0;
 
@@ -2517,8 +2532,7 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 	if (ret)
 		goto err;
 
-	ret = bch2_write_inode(c, inode, bch2_truncate_start_fn,
-			       &new_i_size, 0);
+	ret = bch2_write_inode(c, inode, bch2_truncate_start_fn, iattr);
 	if (unlikely(ret))
 		goto err;
 
@@ -2530,10 +2544,7 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 	if (unlikely(ret))
 		goto err;
 
-	setattr_copy(&inode->v, iattr);
-
-	ret = bch2_write_inode(c, inode, bch2_truncate_finish_fn, NULL,
-			       ATTR_MTIME|ATTR_CTIME);
+	ret = bch2_write_inode(c, inode, bch2_truncate_finish_fn, NULL);
 err:
 	pagecache_block_put(&mapping->add_lock);
 	return ret;
@@ -2547,6 +2558,7 @@ static long bch2_fpunch(struct bch_inode_info *inode, loff_t offset, loff_t len)
 	struct address_space *mapping = inode->v.i_mapping;
 	u64 discard_start = round_up(offset, block_bytes(c)) >> 9;
 	u64 discard_end = round_down(offset + len, block_bytes(c)) >> 9;
+	struct timespec64 now;
 	int ret = 0;
 
 	inode_lock(&inode->v);
@@ -2573,7 +2585,8 @@ static long bch2_fpunch(struct bch_inode_info *inode, loff_t offset, loff_t len)
 	if (discard_start < discard_end)
 		ret = __bch2_fpunch(c, inode, discard_start, discard_end);
 
-	/* XXX: update mtime/ctime */
+	now = current_time(&inode->v);
+	bch2_update_time(&inode->v, &now, S_CTIME|S_MTIME);
 err:
 	pagecache_block_put(&mapping->add_lock);
 	inode_unlock(&inode->v);
