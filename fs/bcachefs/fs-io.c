@@ -235,6 +235,7 @@ static int sum_sector_overwrites(struct btree_trans *trans,
 				 struct btree_iter *extent_iter,
 				 struct bkey_i *new,
 				 bool may_allocate,
+				 bool *maybe_extending,
 				 s64 *delta)
 {
 	struct btree_iter *iter;
@@ -242,6 +243,7 @@ static int sum_sector_overwrites(struct btree_trans *trans,
 	int ret = 0;
 
 	*delta = 0;
+	*maybe_extending = true;
 
 	iter = bch2_trans_copy_iter(trans, extent_iter);
 	if (IS_ERR(iter))
@@ -262,8 +264,15 @@ static int sum_sector_overwrites(struct btree_trans *trans,
 			(bkey_extent_is_allocation(&new->k) -
 			 bkey_extent_is_allocation(old.k));
 
-		if (bkey_cmp(old.k->p, new->k.p) >= 0)
+		/*
+		 * XXX: we need to check for old > new for the maybe_extending
+		 * check
+		 */
+		if (bkey_cmp(old.k->p, new->k.p) >= 0) {
+			if (bkey_extent_is_data(old.k))
+				*maybe_extending = false;
 			break;
+		}
 	}
 
 	bch2_trans_iter_put(trans, iter);
@@ -285,7 +294,7 @@ int bch2_extent_update(struct btree_trans *trans,
 	struct btree_iter *inode_iter = NULL;
 	struct bch_inode_unpacked inode_u;
 	struct bkey_inode_buf inode_p;
-	bool extended = false;
+	bool extending = false;
 	s64 i_sectors_delta;
 	int ret;
 
@@ -294,7 +303,8 @@ int bch2_extent_update(struct btree_trans *trans,
 		return ret;
 
 	ret = sum_sector_overwrites(trans, extent_iter, k,
-				    may_allocate, &i_sectors_delta);
+				    may_allocate, &extending,
+				    &i_sectors_delta);
 	if (ret)
 		return ret;
 
@@ -302,9 +312,7 @@ int bch2_extent_update(struct btree_trans *trans,
 
 	new_i_size = min(k->k.p.offset << 9, new_i_size);
 
-	/* XXX: inode->i_size locking */
-	if (i_sectors_delta ||
-	    new_i_size > inode->ei_inode.bi_size) {
+	if (i_sectors_delta || extending) {
 		inode_iter = bch2_inode_peek(trans, &inode_u,
 				k->k.p.inode, BTREE_ITER_INTENT);
 		if (IS_ERR(inode_iter))
@@ -319,10 +327,12 @@ int bch2_extent_update(struct btree_trans *trans,
 		if (!(inode_u.bi_flags & BCH_INODE_I_SIZE_DIRTY) &&
 		    new_i_size > inode_u.bi_size) {
 			inode_u.bi_size = new_i_size;
-			extended = true;
+			extending = true;
+		} else {
+			extending = false;
 		}
 
-		if (i_sectors_delta || extended) {
+		if (i_sectors_delta || extending) {
 			bch2_inode_pack(&inode_p, &inode_u);
 			bch2_trans_update(trans, inode_iter,
 					  &inode_p.inode.k_i);
@@ -338,14 +348,14 @@ int bch2_extent_update(struct btree_trans *trans,
 	if (ret)
 		goto err;
 
-	if (i_sectors_delta || extended) {
+	if (i_sectors_delta || extending) {
 		inode->ei_inode.bi_sectors	= inode_u.bi_sectors;
 		inode->ei_inode.bi_size		= inode_u.bi_size;
 	}
 
 	if (direct)
 		i_sectors_acct(c, inode, quota_res, i_sectors_delta);
-	if (direct && extended) {
+	if (direct && extending) {
 		spin_lock(&inode->v.i_lock);
 		if (new_i_size > inode->v.i_size)
 			i_size_write(&inode->v, new_i_size);
