@@ -284,13 +284,11 @@ err:
 
 	ret = bch2_trans_exit(&trans) ?: ret;
 
-	mutex_lock(&dst_inode->ei_update_lock);
 	if (dst_inode->v.i_size < new_i_size) {
 		i_size_write(&dst_inode->v, new_i_size);
 		ret = bch2_write_inode_size(c, dst_inode, new_i_size,
 					    ATTR_MTIME|ATTR_CTIME);
 	}
-	mutex_unlock(&dst_inode->ei_update_lock);
 
 	return dst_done ?: ret;
 }

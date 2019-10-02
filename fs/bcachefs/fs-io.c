@@ -2447,12 +2447,8 @@ static int bch2_extend(struct bch_inode_info *inode, struct iattr *iattr)
 	truncate_setsize(&inode->v, iattr->ia_size);
 	setattr_copy(&inode->v, iattr);
 
-	mutex_lock(&inode->ei_update_lock);
-	ret = bch2_write_inode_size(c, inode, inode->v.i_size,
-				    ATTR_MTIME|ATTR_CTIME);
-	mutex_unlock(&inode->ei_update_lock);
-
-	return ret;
+	return bch2_write_inode_size(c, inode, inode->v.i_size,
+				     ATTR_MTIME|ATTR_CTIME);
 }
 
 static int bch2_truncate_finish_fn(struct bch_inode_info *inode,
@@ -2521,11 +2517,8 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 	if (ret)
 		goto err;
 
-	mutex_lock(&inode->ei_update_lock);
 	ret = bch2_write_inode(c, inode, bch2_truncate_start_fn,
 			       &new_i_size, 0);
-	mutex_unlock(&inode->ei_update_lock);
-
 	if (unlikely(ret))
 		goto err;
 
@@ -2539,10 +2532,8 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 
 	setattr_copy(&inode->v, iattr);
 
-	mutex_lock(&inode->ei_update_lock);
 	ret = bch2_write_inode(c, inode, bch2_truncate_finish_fn, NULL,
 			       ATTR_MTIME|ATTR_CTIME);
-	mutex_unlock(&inode->ei_update_lock);
 err:
 	pagecache_block_put(&mapping->add_lock);
 	return ret;
@@ -2645,10 +2636,8 @@ static long bch2_fcollapse_finsert(struct bch_inode_info *inode,
 
 	if (insert) {
 		i_size_write(&inode->v, new_size);
-		mutex_lock(&inode->ei_update_lock);
 		ret = bch2_write_inode_size(c, inode, new_size,
 					    ATTR_MTIME|ATTR_CTIME);
-		mutex_unlock(&inode->ei_update_lock);
 	} else {
 		ret = __bch2_fpunch(c, inode, offset >> 9,
 				    (offset + len) >> 9);
@@ -2789,10 +2778,8 @@ bkey_err:
 
 	if (!insert) {
 		i_size_write(&inode->v, new_size);
-		mutex_lock(&inode->ei_update_lock);
 		ret = bch2_write_inode_size(c, inode, new_size,
 					    ATTR_MTIME|ATTR_CTIME);
-		mutex_unlock(&inode->ei_update_lock);
 	}
 err:
 	bch2_trans_exit(&trans);
@@ -2922,9 +2909,7 @@ bkey_err:
 	    end > inode->v.i_size) {
 		i_size_write(&inode->v, end);
 
-		mutex_lock(&inode->ei_update_lock);
 		ret = bch2_write_inode_size(c, inode, inode->v.i_size, 0);
-		mutex_unlock(&inode->ei_update_lock);
 	}
 
 	/* blech */
@@ -2937,12 +2922,9 @@ bkey_err:
 		if (ret)
 			goto err;
 
-		if (inode->ei_inode.bi_size != inode->v.i_size) {
-			mutex_lock(&inode->ei_update_lock);
+		if (inode->ei_inode.bi_size != inode->v.i_size)
 			ret = bch2_write_inode_size(c, inode,
 						    inode->v.i_size, 0);
-			mutex_unlock(&inode->ei_update_lock);
-		}
 	}
 err:
 	bch2_trans_exit(&trans);
