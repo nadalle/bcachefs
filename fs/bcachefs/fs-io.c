@@ -2581,6 +2581,8 @@ static long bch2_fpunch(struct bch_inode_info *inode, loff_t offset, loff_t len)
 
 	if (discard_start < discard_end)
 		ret = __bch2_fpunch(c, inode, discard_start, discard_end);
+
+	/* XXX: update mtime/ctime */
 err:
 	pagecache_block_put(&mapping->add_lock);
 	inode_unlock(&inode->v);
