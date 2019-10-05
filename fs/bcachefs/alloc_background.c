@@ -4,6 +4,7 @@
 #include "alloc_foreground.h"
 #include "btree_cache.h"
 #include "btree_io.h"
+#include "btree_key_cache.h"
 #include "btree_update.h"
 #include "btree_update_interior.h"
 #include "btree_gc.h"
@@ -279,6 +280,11 @@ static int bch2_alloc_write_key(struct btree_trans *trans,
 	struct bkey_i_alloc *a;
 	int ret;
 retry:
+	ret = bch2_btree_key_cache_flush(trans,
+			BTREE_ID_ALLOC, iter->pos);
+	if (ret)
+		goto err;
+
 	k = bch2_btree_iter_peek_slot(iter);
 	ret = bkey_err(k);
 	if (ret)
@@ -379,10 +385,8 @@ int bch2_alloc_replay_key(struct bch_fs *c, struct bkey_i *k)
 				   BTREE_ITER_SLOTS|BTREE_ITER_INTENT);
 
 	ret = bch2_alloc_write_key(&trans, iter,
-				   BTREE_INSERT_NOFAIL|
 				   BTREE_INSERT_LAZY_RW|
-				   BTREE_INSERT_JOURNAL_REPLAY|
-				   BTREE_INSERT_NOMARK);
+				   BTREE_INSERT_JOURNAL_REPLAY);
 	bch2_trans_exit(&trans);
 	return ret < 0 ? ret : 0;
 }
@@ -870,7 +874,7 @@ static int bch2_invalidate_one_bucket2(struct btree_trans *trans,
 
 	bch2_btree_iter_set_pos(iter, POS(ca->dev_idx, b));
 retry:
-	k = bch2_btree_iter_peek_slot(iter);
+	k = bch2_btree_iter_peek_cached(iter);
 	ret = bkey_err(k);
 	if (ret)
 		return ret;
@@ -996,7 +1000,7 @@ static int bch2_invalidate_buckets(struct bch_fs *c, struct bch_dev *ca)
 
 	iter = bch2_trans_get_iter(&trans, BTREE_ID_ALLOC,
 				   POS(ca->dev_idx, 0),
-				   BTREE_ITER_SLOTS|BTREE_ITER_INTENT);
+				   BTREE_ITER_CACHED|BTREE_ITER_INTENT);
 
 	/* Only use nowait if we've already invalidated at least one bucket: */
 	while (!ret &&
