@@ -507,7 +507,7 @@ static void bch2_set_page_dirty(struct bch_fs *c,
 		 * This can happen if we race with the error path in
 		 * bch2_writepage_io_done():
 		 */
-		sectors = min_t(unsigned, sectors, res->disk.sectors);
+		sectors = min_t(u64, sectors, res->disk.sectors);
 
 		s->s[i].replicas_reserved += sectors;
 		res->disk.sectors -= sectors;
@@ -1559,7 +1559,7 @@ retry_reservation:
 		unsigned pg_offset = (offset + copied) & (PAGE_SIZE - 1);
 		unsigned pg_len = min_t(unsigned, len - copied,
 					PAGE_SIZE - pg_offset);
-		unsigned pg_copied = iov_iter_copy_from_user_atomic(page,
+		size_t pg_copied = iov_iter_copy_from_user_atomic(page,
 						iter, pg_offset, pg_len);
 
 		if (!pg_copied)
@@ -1641,7 +1641,7 @@ static ssize_t bch2_buffered_write(struct kiocb *iocb, struct iov_iter *iter)
 	/* Break up the write into chunks of at most WRITE_BATCH_PAGES. */
 	do {
 		unsigned offset = pos & (PAGE_SIZE - 1);
-		unsigned bytes = min_t(unsigned long, iov_iter_count(iter),
+		unsigned bytes = min_t(size_t, iov_iter_count(iter),
 			      PAGE_SIZE * WRITE_BATCH_PAGES - offset);
 again:
 		/*
@@ -1684,7 +1684,7 @@ again:
 			 * because not all segments in the iov can be copied at
 			 * once without a pagefault.
 			 */
-			bytes = min_t(unsigned long, PAGE_SIZE - offset,
+			bytes = min_t(size_t, PAGE_SIZE - offset,
 				      iov_iter_single_seg_count(iter));
 			goto again;
 		}
