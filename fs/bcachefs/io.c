@@ -382,6 +382,14 @@ int bch2_fpunch(struct bch_fs *c, u64 inum, u64 start, u64 end,
 	return ret;
 }
 
+/**
+ * Write queued metadata associated with a write_op in a transaction.
+ *
+ * Because the queued extents were constructed prior to the transaction, they
+ * may overlap or extend existing data in the btree or journal.
+ *
+ * XXX Needs better documentation to describe the key mutations.
+ */
 int bch2_write_index_default(struct bch_write_op *op)
 {
 	struct bch_fs *c = op->c;
@@ -510,7 +518,9 @@ static void bch2_write_done(struct closure *cl)
 }
 
 /**
- * bch_write_index - after a write, update index to point to new data
+ * bch_write_index - after a write, update index to point to new data.
+ *
+ * The queued extent metadata describes data written during the write.
  */
 static void __bch2_write_index(struct bch_write_op *op)
 {
@@ -521,6 +531,7 @@ static void __bch2_write_index(struct bch_write_op *op)
 	unsigned dev;
 	int ret;
 
+	/* Remove extent keys where IO failed. */
 	for (src = keys->keys; src != keys->top; src = n) {
 		n = bkey_next(src);
 
@@ -549,6 +560,11 @@ static void __bch2_write_index(struct bch_write_op *op)
 	for_each_keylist_key(keys, k)
 		bch2_rebalance_add_key(c, bkey_i_to_s_c(k), &op->opts);
 
+	/*
+	 * Actually perform the write. The index_update_fn is probably
+	 * bch2_write_index_default() for new writes, but this is also used for
+	 * migration.
+	 */
 	if (!bch2_keylist_empty(keys)) {
 		u64 sectors_start = keylist_sectors(keys);
 		int ret = op->index_update_fn(op);
@@ -576,6 +592,11 @@ err:
 	goto out;
 }
 
+/**
+ * Journal the extent etc. updates associated with a write. In WRITE_FLUSH mode
+ * (sync), the journal updates will happen immediately, otherwise they will
+ * just queue for the next flush.
+ */
 static void bch2_write_index(struct closure *cl)
 {
 	struct bch_write_op *op = container_of(cl, struct bch_write_op, cl);
@@ -624,6 +645,13 @@ static void bch2_write_endio(struct bio *bio)
 		continue_at_nobarrier(cl, bch2_write_index, index_update_wq(op));
 }
 
+/**
+ * Encode metadata about an extent being written in the given write_op.
+ *
+ * The metadata consists of a bkey of the correct format depending on options
+ * such as crc, compression, etc.  The bkey is journaled later at the end of
+ * the write.
+ */
 static void init_append_extent(struct bch_write_op *op,
 			       struct write_point *wp,
 			       struct bversion version,
@@ -840,6 +868,20 @@ static enum prep_encoded_ret {
 	return PREP_ENCODED_OK;
 }
 
+/**
+ * Construct btree metadata for an extent as well as the extent bio. The
+ * metadata is stored in the op, to be journaled later in bch2_write_index().
+ *
+ * The original data comes from the op's wbio. Depending on the situation
+ * (buffered vs direct IO, encryption, etc.), it may be usable, or it may be
+ * copied to a bounce buffer.
+ *
+ * The bio returned will be encrypted, if appropriate, and will be correctly
+ * sized.
+ *
+ * Returns 0 if this is the last extent in the op, 1 if more extents are
+ * needed, or an error.
+ */
 static int bch2_write_extent(struct bch_write_op *op, struct write_point *wp,
 			     struct bio **_dst)
 {
@@ -1033,13 +1075,23 @@ err:
 	return ret;
 }
 
+/**
+ * Implementation of bch2_write.
+ *
+ * In the fast path, this function initiates IO and then returns with the
+ * closure set up to wait on the work (including the journal update). However,
+ * when out of space, this function will block waiting for space to be freed.
+ *
+ * XXX Why not just pass the write op? There don't seem to be any other
+ * references.
+ */
 static void __bch2_write(struct closure *cl)
 {
 	struct bch_write_op *op = container_of(cl, struct bch_write_op, cl);
 	struct bch_fs *c = op->c;
 	struct write_point *wp;
 	struct bio *bio;
-	bool skip_put = true;
+	bool single_extent = true;
 	int ret;
 again:
 	memset(&op->failed, 0, sizeof(op->failed));
@@ -1060,6 +1112,11 @@ again:
 					BKEY_EXTENT_U64s_MAX))
 			goto flush_io;
 
+		/*
+		 * Allocate needed space. If the space is not immediately
+		 * available, the closure will be attached to a space-freed
+		 * wakeup and will be waited on below (if applicable).
+		 */
 		wp = bch2_alloc_sectors_start(c,
 			op->target,
 			op->opts.erasure_code,
@@ -1072,6 +1129,7 @@ again:
 			(op->flags & BCH_WRITE_ALLOC_NOWAIT) ? NULL : cl);
 		EBUG_ON(!wp);
 
+		/* Do we need to wait? */
 		if (unlikely(IS_ERR(wp))) {
 			if (unlikely(PTR_ERR(wp) != -EAGAIN)) {
 				ret = PTR_ERR(wp);
@@ -1081,6 +1139,14 @@ again:
 			goto flush_io;
 		}
 
+		/*
+		 * Encode the extent and prepare it for write. The provisional
+		 * extent metadata is cached on the op for later. Returns a bio
+		 * for this extent, which may be encrypted etc.
+		 *
+		 * ret = 1 if there are more extents, 0 if this is the last
+		 * one.
+		 */
 		bch2_open_bucket_get(c, wp, &op->open_buckets);
 		ret = bch2_write_extent(op, wp, &bio);
 		bch2_alloc_sectors_done(c, wp);
@@ -1089,13 +1155,19 @@ again:
 			goto err;
 
 		if (ret)
-			skip_put = false;
+			single_extent = false;
 
+		/*
+		 * Start IO on extent data.  If this write spans multiple
+		 * extents, then the closure gets an extra reference for each
+		 * one. Otherwise, as an obscure micro-optimization for atomic
+		 * operations, it avoids the reference and uses a flag.
+		 */
 		bio->bi_end_io	= bch2_write_endio;
 		bio->bi_private	= &op->cl;
 		bio->bi_opf |= REQ_OP_WRITE;
 
-		if (!skip_put)
+		if (!single_extent)
 			closure_get(bio->bi_private);
 		else
 			op->flags |= BCH_WRITE_SKIP_CLOSURE_PUT;
@@ -1107,17 +1179,35 @@ again:
 					  key_to_write);
 	} while (ret);
 
-	if (!skip_put)
+	/*
+	 * bch2_write_index needs to be called once for each write. In the case
+	 * of a single extent, as a micro-optimization, bch2_write_endio() will
+	 * schedule the index update for us. Otherwise, we do it here -- but
+	 * the actual call is done once the closure reference is dropped on IO
+	 * completion.
+	 */
+	if (!single_extent)
 		continue_at(cl, bch2_write_index, index_update_wq(op));
 	return;
+
 err:
 	op->error = ret;
 
 	continue_at(cl, bch2_write_index, index_update_wq(op));
 	return;
+
 flush_io:
+	/*
+	 * Wait for allocation (and previous write(s)) to complete.
+	 *
+	 * XXX Need to wake up copygc etc. here?
+	 */
 	closure_sync(cl);
 
+	/*
+	 * This can happen because the write index isn't attached to the
+	 * closure until after all extents have been started.
+	 */
 	if (!bch2_keylist_empty(&op->insert_keys)) {
 		__bch2_write_index(op);
 
@@ -1217,17 +1307,20 @@ void bch2_write(struct closure *cl)
 		goto err;
 	}
 
+	/* Wake io clock waiters (copygc). */
 	bch2_increment_clock(c, bio_sectors(bio), WRITE);
 
 	data_len = min_t(u64, bio->bi_iter.bi_size,
 			 op->new_i_size - (op->pos.offset << 9));
 
+	/* Inline write. */
 	if (c->opts.inline_data &&
 	    data_len <= min(block_bytes(c) / 2, 1024U)) {
 		bch2_write_data_inline(op, data_len);
 		return;
 	}
 
+	/* Normal write. */
 	continue_at_nobarrier(cl, __bch2_write, NULL);
 	return;
 err:

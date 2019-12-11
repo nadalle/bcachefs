@@ -135,6 +135,10 @@ static struct io_timer *get_expired_timer(struct io_clock *clock,
 	return ret;
 }
 
+/**
+ * Slow path for bch2_increment_clock, called when the per cpu buffer is
+ * exhausted.
+ */
 void __bch2_increment_clock(struct io_clock *clock)
 {
 	struct io_timer *timer;

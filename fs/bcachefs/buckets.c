@@ -1883,6 +1883,17 @@ void __bch2_disk_reservation_put(struct bch_fs *c, struct disk_reservation *res)
 
 #define SECTORS_CACHE	1024
 
+/**
+ * Move sectors from cached available sectors in the bch_fs to the
+ * disk_reservation for an individual write.
+ *
+ * Reservations are cached on a per-cpu basis, and will be rebalanced and
+ * recalculated as needed.
+ *
+ * Note that the disk reservation is in terms of theoretical fs capacity, not
+ * physical free space. Actually performing the write may require the copygc to
+ * free space later.
+ */
 int bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 			      unsigned sectors, int flags)
 {

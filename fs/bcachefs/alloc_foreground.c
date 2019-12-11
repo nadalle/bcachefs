@@ -222,7 +222,7 @@ static inline unsigned open_buckets_reserved(enum alloc_reserve reserve)
  * bch_bucket_alloc - allocate a single bucket from a specific device
  *
  * Returns index of bucket on success, 0 on failure
- * */
+ */
 struct open_bucket *bch2_bucket_alloc(struct bch_fs *c, struct bch_dev *ca,
 				      enum alloc_reserve reserve,
 				      bool may_alloc_partial,
@@ -853,7 +853,10 @@ out:
 }
 
 /*
- * Get us an open_bucket we can allocate from, return with it locked:
+ * Get us an open_bucket we can allocate from, return with it locked.
+ *
+ * If it needs to block, the provided closure will be set so the caller can
+ * wait on it for the needed space.
  */
 struct write_point *bch2_alloc_sectors_start(struct bch_fs *c,
 				unsigned target,

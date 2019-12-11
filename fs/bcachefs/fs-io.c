@@ -386,6 +386,13 @@ static void bch2_page_reservation_put(struct bch_fs *c,
 	bch2_quota_reservation_put(c, inode, &res->quota);
 }
 
+/**
+ * Acquire a reservation for the number of disk (and quota) sectors needed to
+ * perform this write.
+ *
+ * Note that the disk reservation is in terms of filesystem capacity, not
+ * current free space (allocating may still block on copygc).
+ */
 static int bch2_page_reservation_get(struct bch_fs *c,
 			struct bch_inode_info *inode, struct page *page,
 			struct bch2_page_reservation *res,
@@ -466,6 +473,16 @@ static void bch2_clear_page_bits(struct page *page)
 	bch2_page_state_release(page);
 }
 
+/**
+ * Mark the page dirty, and account for its reserved sectors.
+ *
+ * The disk reservation must live until the page is actually written out, so
+ * the reservation is transferred from the bch2_page_reservation to the
+ * bch_page_state for later processing.
+ *
+ * The number of new sectors is also calculated, and the inode's block count
+ * and quota reservation is updated as well.
+ */
 static void bch2_set_page_dirty(struct bch_fs *c,
 			struct bch_inode_info *inode, struct page *page,
 			struct bch2_page_reservation *res,
@@ -479,6 +496,7 @@ static void bch2_set_page_dirty(struct bch_fs *c,
 
 	spin_lock(&s->lock);
 
+	/* Transfer disk reservation and check overwrites. */
 	for (i = round_down(offset, block_bytes(c)) >> 9;
 	     i < round_up(offset + len, block_bytes(c)) >> 9;
 	     i++) {
@@ -502,6 +520,7 @@ static void bch2_set_page_dirty(struct bch_fs *c,
 
 	spin_unlock(&s->lock);
 
+	/* Update inode if any blocks weren't overwrites. */
 	if (dirty_sectors)
 		i_sectors_acct(c, inode, &res->quota, dirty_sectors);
 
@@ -937,6 +956,9 @@ int bch2_readpages(struct file *file, struct address_space *mapping,
 	return 0;
 }
 
+/**
+ * Start read on a given page.
+ */
 static void __bchfs_readpage(struct bch_fs *c, struct bch_read_bio *rbio,
 			     u64 inum, struct page *page)
 {
@@ -978,6 +1000,9 @@ static void bch2_read_single_page_end_io(struct bio *bio)
 	complete(bio->bi_private);
 }
 
+/**
+ * Synchronously read & fill the given page.
+ */
 static int bch2_read_single_page(struct page *page,
 				 struct address_space *mapping)
 {
@@ -1028,6 +1053,9 @@ static void bch2_writepage_io_free(struct closure *cl)
 	bio_put(&io->op.wbio.bio);
 }
 
+/**
+ * Finish up a buffered write once its IO is complete.
+ */
 static void bch2_writepage_io_done(struct closure *cl)
 {
 	struct bch_writepage_io *io = container_of(cl,
@@ -1094,6 +1122,9 @@ static void bch2_writepage_io_done(struct closure *cl)
 	closure_return_with_destructor(&io->cl, bch2_writepage_io_free);
 }
 
+/**
+ * Flush collected buffered write(s) to disk.
+ */
 static void bch2_writepage_do_io(struct bch_writepage_state *w)
 {
 	struct bch_writepage_io *io = w->io;
@@ -1270,6 +1301,9 @@ do_io:
 	return 0;
 }
 
+/**
+ * VFS entry point to flush buffered writes to disk.
+ */
 int bch2_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
 	struct bch_fs *c = mapping->host->i_sb->s_fs_info;
@@ -1286,6 +1320,9 @@ int bch2_writepages(struct address_space *mapping, struct writeback_control *wbc
 	return ret;
 }
 
+/**
+ * VFS entry point to flush a single buffered page to disk.
+ */
 int bch2_writepage(struct page *page, struct writeback_control *wbc)
 {
 	struct bch_fs *c = page->mapping->host->i_sb->s_fs_info;
@@ -1427,6 +1464,9 @@ int bch2_write_end(struct file *file, struct address_space *mapping,
 
 #define WRITE_BATCH_PAGES	32
 
+/**
+ * Buffered write an individual batch of pages.
+ */
 static int __bch2_buffered_write(struct bch_inode_info *inode,
 				 struct address_space *mapping,
 				 struct iov_iter *iter,
@@ -1447,6 +1487,7 @@ static int __bch2_buffered_write(struct bch_inode_info *inode,
 
 	bch2_page_reservation_init(c, inode, &res);
 
+	/* Find and lock the pages, or as many as we can get. */
 	for (i = 0; i < nr_pages; i++) {
 		pages[i] = grab_cache_page_write_begin(mapping, index + i, 0);
 		if (!pages[i]) {
@@ -1461,12 +1502,14 @@ static int __bch2_buffered_write(struct bch_inode_info *inode,
 		}
 	}
 
+	/* Handle partial overwrite at beginning. */
 	if (offset && !PageUptodate(pages[0])) {
 		ret = bch2_read_single_page(pages[0], mapping);
 		if (ret)
 			goto out;
 	}
 
+	/* Handle partial overwrite at end. */
 	if ((pos + len) & (PAGE_SIZE - 1) &&
 	    !PageUptodate(pages[nr_pages - 1])) {
 		if ((index + nr_pages - 1) << PAGE_SHIFT >= inode->v.i_size) {
@@ -1478,6 +1521,12 @@ static int __bch2_buffered_write(struct bch_inode_info *inode,
 		}
 	}
 
+	/*
+	 * Acquire disk (and quota) reservations for these pages. This
+	 * guarantees eventual filesystem capacity, but not physical space.
+	 *
+	 * Doc TODO: Why do we fill the page on error?
+	 */
 	while (reserved < len) {
 		struct page *page = pages[(offset + reserved) >> PAGE_SHIFT];
 		unsigned pg_offset = (offset + reserved) & (PAGE_SIZE - 1);
@@ -1499,10 +1548,12 @@ retry_reservation:
 		reserved += pg_len;
 	}
 
+	/* Handle existing cache aliasing. */
 	if (mapping_writably_mapped(mapping))
 		for (i = 0; i < nr_pages; i++)
 			flush_dcache_page(pages[i]);
 
+	/* Copy the actual data from userspace into the buffer cache. */
 	while (copied < len) {
 		struct page *page = pages[(offset + copied) >> PAGE_SHIFT];
 		unsigned pg_offset = (offset + copied) & (PAGE_SIZE - 1);
@@ -1522,6 +1573,10 @@ retry_reservation:
 	if (!copied)
 		goto out;
 
+	/*
+	 * In case of a short copy, make sure the last page isn't partially
+	 * filled when we expected more data.
+	 */
 	if (copied < len &&
 	    ((offset + copied) & (PAGE_SIZE - 1))) {
 		struct page *page = pages[(offset + copied) >> PAGE_SHIFT];
@@ -1532,11 +1587,13 @@ retry_reservation:
 		}
 	}
 
+	/* Extend file. */
 	spin_lock(&inode->v.i_lock);
 	if (pos + copied > inode->v.i_size)
 		i_size_write(&inode->v, pos + copied);
 	spin_unlock(&inode->v.i_lock);
 
+	/* Mark touched pages dirty, transfer reservations, update inode. */
 	while (set_dirty < copied) {
 		struct page *page = pages[(offset + set_dirty) >> PAGE_SHIFT];
 		unsigned pg_offset = (offset + set_dirty) & (PAGE_SIZE - 1);
@@ -1561,11 +1618,15 @@ out:
 		put_page(pages[i]);
 	}
 
+	/* Return unused disk/quota reservations. */
 	bch2_page_reservation_put(c, inode, &res);
 
 	return copied ?: ret;
 }
 
+/**
+ * Initial entry point for buffered writes.
+ */
 static ssize_t bch2_buffered_write(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;
@@ -1577,6 +1638,7 @@ static ssize_t bch2_buffered_write(struct kiocb *iocb, struct iov_iter *iter)
 
 	bch2_pagecache_add_get(&inode->ei_pagecache_lock);
 
+	/* Break up the write into chunks of at most WRITE_BATCH_PAGES. */
 	do {
 		unsigned offset = pos & (PAGE_SIZE - 1);
 		unsigned bytes = min_t(unsigned long, iov_iter_count(iter),
@@ -1795,6 +1857,17 @@ ssize_t bch2_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 /* O_DIRECT writes */
 
+/**
+ * Main IO driver for direct writes.
+ *
+ * The control flow in this function is complicated. When used with AIO, this
+ * function both initiates the write and later completes the write in a
+ * callback and then (possibly) initiates more writes. In this way it may chain
+ * through an indeterminate number of callbacks.
+ *
+ * Pay attention to dio->loop: it specifies whether this is the initial call or
+ * the callback.
+ */
 static long bch2_dio_write_loop(struct dio_write *dio)
 {
 	bool kthread = (current->flags & PF_KTHREAD) != 0;
@@ -1810,15 +1883,21 @@ static long bch2_dio_write_loop(struct dio_write *dio)
 	bool sync;
 	long ret;
 
+	/* Callback? */
 	if (dio->loop)
 		goto loop;
 
+	/*
+	 * In async mode, this loop may be executing after completing a
+	 * previous portion of the write (see loop: below).
+	 */
 	while (1) {
 		if (kthread)
 			use_mm(dio->mm);
 		BUG_ON(current->faults_disabled_mapping);
 		current->faults_disabled_mapping = mapping;
 
+		/* (Maybe) pin pages and insert into bio. */
 		ret = bio_iov_iter_get_pages(bio, &dio->iter);
 
 		current->faults_disabled_mapping = NULL;
@@ -1848,6 +1927,11 @@ static long bch2_dio_write_loop(struct dio_write *dio)
 
 		task_io_account_write(bio->bi_iter.bi_size);
 
+		/*
+		 * Make a private copy of the iov for later if this is going to
+		 * be a chain of async calls, since the original will go out of
+		 * scope.
+		 */
 		if (!dio->sync && !dio->loop && dio->iter.count) {
 			struct iovec *iov = dio->inline_vecs;
 
@@ -1866,14 +1950,20 @@ static long bch2_dio_write_loop(struct dio_write *dio)
 			dio->iter.iov = iov;
 		}
 do_io:
+		/* Start asynchronous write. */
 		dio->loop = true;
 		closure_call(&dio->op.cl, bch2_write, NULL, NULL);
 
+		/*
+		 * If async, we'll reenter as loop: below via a
+		 * callback. Otherwise, complete this portion of the write.
+		 */
 		if (dio->sync)
 			wait_for_completion(&dio->done);
 		else
 			return -EIOCBQUEUED;
 loop:
+		/* Finish up accounting, inode size etc. after write. */
 		i_sectors_acct(c, inode, &dio->quota_res,
 			       dio->op.i_sectors_delta);
 		dio->op.i_sectors_delta = 0;
@@ -1926,6 +2016,9 @@ static void bch2_dio_write_loop_async(struct bch_write_op *op)
 		bch2_dio_write_loop(dio);
 }
 
+/**
+ * Perform a direct write. The write will continue asynchronously with AIO.
+ */
 static noinline
 ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 {
@@ -1958,18 +2051,25 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 	if (unlikely(ret))
 		goto err;
 
+	/*
+	 * Reject unaligned IO.
+	 *
+	 * XXX Shouldn't this set ret = -EINVAL?
+	 */
 	if (unlikely((req->ki_pos|iter->count) & (block_bytes(c) - 1)))
 		goto err;
 
 	inode_dio_begin(&inode->v);
 	bch2_pagecache_block_get(&inode->ei_pagecache_lock);
 
+	/* Avoid doing dio holding the inode lock. */
 	extending = req->ki_pos + iter->count > inode->v.i_size;
 	if (!extending) {
 		inode_unlock(&inode->v);
 		locked = false;
 	}
 
+	/* Construct dio & write op */
 	bio = bio_alloc_bioset(GFP_KERNEL,
 			       iov_iter_npages(iter, BIO_MAX_PAGES),
 			       &c->dio_write_bioset);
@@ -1994,6 +2094,7 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 	    !c->opts.journal_flush_disabled)
 		dio->op.flags |= BCH_WRITE_FLUSH;
 
+	/* Check quota. */
 	ret = bch2_quota_reservation_add(c, inode, &dio->quota_res,
 					 iter->count >> 9, true);
 	if (unlikely(ret))
@@ -2001,6 +2102,14 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 
 	dio->op.nr_replicas	= dio->op.opts.data_replicas;
 
+	/*
+	 * Acquire disk reservation as a fast path.
+	 *
+	 * If the write is an overwrite, a disk reservation isn't strictly
+	 * required -- at worst, we'll have to wait for space to be reaped
+	 * during garbage collection. However, acquiring a reservation is much
+	 * cheaper than checking if for overwrite.
+	 */
 	ret = bch2_disk_reservation_get(c, &dio->op.res, iter->count >> 9,
 					dio->op.opts.data_replicas, 0);
 	if (unlikely(ret) &&
@@ -2010,12 +2119,14 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 					dio->op.opts.data_replicas))
 		goto err_put_bio;
 
+	/* Clear buffered writes etc. */
 	ret = write_invalidate_inode_pages_range(mapping,
 					req->ki_pos,
 					req->ki_pos + iter->count - 1);
 	if (unlikely(ret))
 		goto err_put_bio;
 
+	/* Begin IO (and possibly wait). */
 	ret = bch2_dio_write_loop(dio);
 err:
 	if (locked)
@@ -2032,6 +2143,9 @@ err_put_bio:
 	goto err;
 }
 
+/**
+ * VFS entry point for both buffered and direct writes.
+ */
 ssize_t bch2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -2057,6 +2171,7 @@ ssize_t bch2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (ret)
 		goto unlock;
 
+	/* Dirty pages, update inode, etc. */
 	ret = bch2_buffered_write(iocb, from);
 	if (likely(ret > 0))
 		iocb->ki_pos += ret;
@@ -2064,6 +2179,7 @@ unlock:
 	inode_unlock(&inode->v);
 	current->backing_dev_info = NULL;
 
+	/* Handle synchronous write. */
 	if (ret > 0)
 		ret = generic_write_sync(iocb, ret);
 

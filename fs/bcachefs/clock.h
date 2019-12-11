@@ -9,6 +9,15 @@ void bch2_kthread_io_clock_wait(struct io_clock *, unsigned long,
 
 void __bch2_increment_clock(struct io_clock *);
 
+/**
+ * Indicate that a reader/writer is performing a certain amount of disk IO,
+ * possibly waking up a subscriber via an io_timer.
+ *
+ * The IO clocks are critical to driving the copygc and space accounting
+ * systems.
+ *
+ * XXX What happens when we're critically short on space?
+ */
 static inline void bch2_increment_clock(struct bch_fs *c, unsigned sectors,
 					int rw)
 {
